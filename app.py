@@ -1,11 +1,12 @@
-import json
 import os
-import tempfile
+import time
+
 from typing import List
 
 import streamlit as st
 from google import genai
 from google.genai import types
+
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from docx import Document
@@ -20,6 +21,9 @@ st.set_page_config(
     layout="wide",
 )
 
+# NOTE: verify this model name is valid for your account/API version before
+# deploying — swap to a model you know is available (e.g. "gemini-2.0-flash")
+# if this one errors out.
 MODEL_NAME = "gemini-3.6-flash"
 
 
@@ -159,22 +163,65 @@ RESUME:
 
 
 def analyze_resume(resume_text: str, job_description: str) -> ResumeAnalysis:
+    """Call Gemini once (with retries on transient 503s) and return a
+    validated ResumeAnalysis object."""
     client = genai.Client(api_key=get_api_key())
+    prompt = build_prompt(resume_text, job_description)
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=build_prompt(resume_text, job_description),
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-            response_schema=ResumeAnalysis,
-        ),
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    system_instruction=(
+                        "You are an expert ATS resume evaluator. "
+                        "Return only valid JSON matching the provided schema. "
+                        "Do not invent information."
+                    ),
+                    response_mime_type="application/json",
+                    response_schema=ResumeAnalysis,
+                ),
+            )
+
+            # The SDK auto-parses into the pydantic model when response_schema
+            # is set; fall back to manual validation if that's not populated.
+            parsed = getattr(response, "parsed", None)
+            if isinstance(parsed, ResumeAnalysis):
+                return parsed
+
+            if not response.text:
+                raise RuntimeError("Gemini returned an empty response.")
+
+            return ResumeAnalysis.model_validate_json(response.text)
+
+        except Exception as exc:
+            last_error = exc
+            error_message = str(exc).upper()
+
+            # Retry temporary 503 errors
+            if (
+                ("503" in error_message or "UNAVAILABLE" in error_message)
+                and attempt < 2
+            ):
+                wait_time = 5 * (attempt + 1)
+
+                st.warning(
+                    f"Gemini is temporarily busy. "
+                    f"Retrying in {wait_time} seconds..."
+                )
+
+                time.sleep(wait_time)
+                continue
+
+            raise
+
+    raise RuntimeError(
+        f"Gemini analysis failed after 3 attempts: {last_error}"
     )
-
-    if not response.text:
-        raise RuntimeError("Gemini returned an empty response.")
-
-    return ResumeAnalysis.model_validate_json(response.text)
 
 
 def score_label(score: int) -> str:
@@ -331,4 +378,4 @@ if analyze_button:
     )
 
 st.divider()
-st.caption("Built with Streamlit + Gemini 2.5 Flash")
+st.caption("Built with Streamlit + Gemini 3.6 Flash")
